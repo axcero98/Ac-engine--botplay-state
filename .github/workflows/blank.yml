@@ -1,0 +1,139 @@
+# Workflow: Android CI build (APK signed)
+# Requisitos: configurar secrets en el repo (ver instrucciones abajo)
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Build Android (release, signed)
+    runs-on: ubuntu-latest
+    env:
+      # Cambia según el API / build-tools / NDK que quieras
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      ANDROID_API_LEVEL: "31"
+      ANDROID_BUILD_TOOLS: "31.0.0"
+      ANDROID_NDK_VERSION: "21.4.7075529"
+      HAXE_LIBS: "lime openfl hxcpp flixel flixel-tools" # ajusta / amplía según tu proyecto
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Install essentials
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip p7zip-full git python3 python3-pip
+
+      - name: Install Android command line tools and SDK packages
+        run: |
+          mkdir -p "$ANDROID_SDK_ROOT"
+          cd "$ANDROID_SDK_ROOT"
+          # descargar command line tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          # mover a la estructura esperada
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools/"* "$ANDROID_SDK_ROOT/cmdline-tools/latest/" || true
+          export ANDROID_HOME="$ANDROID_SDK_ROOT"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses
+          sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-${ANDROID_API_LEVEL}" "build-tools;${ANDROID_BUILD_TOOLS}" "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Add Android tools to PATH
+        run: |
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+          echo "${ANDROID_SDK_ROOT}/platform-tools" >> $GITHUB_PATH
+          echo "${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}" >> $GITHUB_PATH
+          echo "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin" >> $GITHUB_PATH
+
+      - name: Install Haxe & haxelib (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y haxe
+          haxe --version
+          haxelib version
+
+      - name: Install project haxelibs (common)
+        run: |
+          # instala las libs que necesites; ajusta HAXE_LIBS si tu proyecto requiere otras libs
+          for lib in $HAXE_LIBS; do
+            haxelib install "$lib" || true
+          done
+          # si tu repo tiene haxelib.json, puedes usar `haxelib install` sobre la lista que indique
+          # preparar lime/openfl
+          haxelib run lime setup
+
+      - name: Build Android (release)
+        run: |
+          # Ajusta comando si tu proyecto necesita un target concreto (apk/aab)
+          lime build android -release
+        env:
+          ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+
+      - name: Decode keystore (from secret) and prepare signing info
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 --decode > keystore.jks
+          ls -la keystore.jks
+
+      - name: Find unsigned APK
+        id: findapk
+        run: |
+          # Buscar el primer APK release generado por lime (heurística común)
+          set -e
+          apk=$(find . -type f -name "*-release.apk" | head -n1)
+          if [ -z "$apk" ]; then
+            apk=$(find . -type f -name "*.apk" | head -n1)
+          fi
+          if [ -z "$apk" ]; then
+            echo "No se encontró ningún APK. Listando directorios para depuración:"
+            find . -maxdepth 4 -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          echo "found_apk=$apk" >> $GITHUB_OUTPUT
+          echo "::notice::Found APK: $apk"
+      - name: Align & Sign APK (zipalign + apksigner)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          unsigned="${{ steps.findapk.outputs.found_apk }}"
+          echo "unsigned apk: $unsigned"
+          # zipalign
+          zipalign_path=$(which zipalign || echo "${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/zipalign")
+          apk_basename=$(basename "$unsigned")
+          aligned="aligned-${apk_basename}"
+          signed="signed-${apk_basename}"
+          $zipalign_path -v -p 4 "$unsigned" "$aligned"
+          # signer: apksigner en build-tools
+          apksigner_path="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          $apksigner_path sign --ks keystore.jks --ks-pass pass:${KEYSTORE_PASSWORD} --ks-key-alias ${KEY_ALIAS} --key-pass pass:${KEY_PASSWORD} --out "$signed" "$aligned"
+          echo "Signed APK: $signed"
+          ls -la "$signed"
+          echo "signed_apk=$signed" >> $GITHUB_OUTPUT
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: ${{ steps.findapk.outputs.found_apk }} # if unsigned used (no keystore), uploade that
+      - name: Upload aligned+signed artifact (if signed)
+        if: ${{ steps.findapk.outputs.found_apk != '' && secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk-signed
+          path: ${{ steps.findapk.outputs.found_apk }} # best effort: the signing step output is printed in logs (signed-*.apk)
